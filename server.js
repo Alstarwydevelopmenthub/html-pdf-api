@@ -5,26 +5,35 @@ const app = express();
 
 const PORT = process.env.PORT || 10000;
 const PDF_API_KEY = process.env.PDF_API_KEY || "";
-const MAX_HTML_BYTES = Number(process.env.MAX_HTML_BYTES || 2 * 1024 * 1024);
+const MAX_HTML_BYTES = Number(process.env.MAX_HTML_BYTES || 10 * 1024 * 1024);
 
+// Serve test UI
 app.use(express.static("public"));
 
+// Accept JSON up to 10MB
 app.use(
   express.json({
-    limit: `${Math.ceil(MAX_HTML_BYTES / 1024 / 1024)}mb`,
+    limit: "10mb",
+  })
+);
+
+// Accept raw HTML too
+app.use(
+  express.text({
+    type: ["text/html", "text/plain"],
+    limit: "10mb",
   })
 );
 
 function sanitizeFilename(name) {
-  const fallback = "document.pdf";
-  if (!name || typeof name !== "string") return fallback;
+  if (!name || typeof name !== "string") return "document.pdf";
 
   const cleaned = name
     .replace(/[/\\?%*:|"<>]/g, "-")
     .replace(/\s+/g, " ")
     .trim();
 
-  if (!cleaned) return fallback;
+  if (!cleaned) return "document.pdf";
   return cleaned.toLowerCase().endsWith(".pdf") ? cleaned : `${cleaned}.pdf`;
 }
 
@@ -32,15 +41,16 @@ function requireApiKey(req, res, next) {
   if (!PDF_API_KEY) {
     return res.status(500).json({
       ok: false,
-      error: "Server is missing PDF_API_KEY environment variable.",
+      error: "PDF_API_KEY is missing in Render environment variables.",
     });
   }
 
   const providedKey = req.header("x-api-key");
+
   if (!providedKey || providedKey !== PDF_API_KEY) {
     return res.status(401).json({
       ok: false,
-      error: "Unauthorized. Missing or invalid x-api-key header.",
+      error: "Unauthorized. Missing or invalid x-api-key.",
     });
   }
 
@@ -48,38 +58,19 @@ function requireApiKey(req, res, next) {
 }
 
 function buildPdfOptions(options = {}) {
-  const safeOptions = {};
-
-  const allowedFormats = new Set(["A4", "A3", "A5", "Letter", "Legal", "Tabloid"]);
-  safeOptions.format = allowedFormats.has(options.format) ? options.format : "A4";
-
-  safeOptions.landscape = Boolean(options.landscape);
-  safeOptions.printBackground = options.printBackground !== false;
-
-  const scale = Number(options.scale);
-  safeOptions.scale = Number.isFinite(scale) && scale >= 0.1 && scale <= 2 ? scale : 1;
-
-  const defaultMargin = {
-    top: "10mm",
-    right: "10mm",
-    bottom: "10mm",
-    left: "10mm",
+  return {
+    format: options.format || "A4",
+    landscape: Boolean(options.landscape),
+    printBackground: options.printBackground !== false,
+    scale: Number(options.scale) || 1,
+    preferCSSPageSize: options.preferCSSPageSize !== false,
+    margin: {
+      top: options.margin?.top || "10mm",
+      right: options.margin?.right || "10mm",
+      bottom: options.margin?.bottom || "10mm",
+      left: options.margin?.left || "10mm",
+    },
   };
-
-  safeOptions.margin = {
-    top: options.margin?.top || defaultMargin.top,
-    right: options.margin?.right || defaultMargin.right,
-    bottom: options.margin?.bottom || defaultMargin.bottom,
-    left: options.margin?.left || defaultMargin.left,
-  };
-
-  if (typeof options.preferCSSPageSize === "boolean") {
-    safeOptions.preferCSSPageSize = options.preferCSSPageSize;
-  } else {
-    safeOptions.preferCSSPageSize = true;
-  }
-
-  return safeOptions;
 }
 
 app.get("/health", (req, res) => {
@@ -91,62 +82,93 @@ app.get("/health", (req, res) => {
 });
 
 app.post("/api/html-to-pdf", requireApiKey, async (req, res) => {
-  const startedAt = Date.now();
+  let browser;
 
   try {
-    const { html, filename, options } = req.body || {};
+    let html;
+    let filename = "document.pdf";
+    let options = {};
+
+    if (typeof req.body === "string") {
+      html = req.body;
+    } else {
+      html = req.body?.html;
+      filename = req.body?.filename || filename;
+      options = req.body?.options || {};
+    }
 
     if (!html || typeof html !== "string") {
       return res.status(400).json({
         ok: false,
-        error: "Missing required field: html must be a string.",
+        error: "Missing HTML. Send JSON with { html: '<html>...</html>' }.",
       });
     }
 
-    const htmlBytes = Buffer.byteLength(html, "utf8");
-    if (htmlBytes > MAX_HTML_BYTES) {
+    const size = Buffer.byteLength(html, "utf8");
+
+    if (size > MAX_HTML_BYTES) {
       return res.status(413).json({
         ok: false,
-        error: `HTML is too large. Maximum allowed size is ${MAX_HTML_BYTES} bytes.`,
+        error: `HTML too large. Size is ${size} bytes. Limit is ${MAX_HTML_BYTES} bytes.`,
       });
     }
 
-    const browser = await chromium.launch({
+    browser = await chromium.launch({
       headless: true,
-      args: ["--no-sandbox", "--disable-dev-shm-usage"],
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--single-process",
+        "--no-zygote",
+      ],
     });
 
-    let pdfBuffer;
+    const page = await browser.newPage();
 
-    try {
-      const page = await browser.newPage();
+    await page.setContent(html, {
+      waitUntil: "load",
+      timeout: 30000,
+    });
 
-      await page.setContent(html, {
-        waitUntil: "networkidle",
-        timeout: 30000,
-      });
+    await page.emulateMedia({ media: "print" });
 
-      await page.emulateMedia({ media: "print" });
-
-      pdfBuffer = await page.pdf(buildPdfOptions(options));
-    } finally {
-      await browser.close();
-    }
-
-    const safeFilename = sanitizeFilename(filename);
+    const pdfBuffer = await page.pdf(buildPdfOptions(options));
 
     res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Disposition", `attachment; filename="${safeFilename}"`);
-    res.setHeader("X-Conversion-Time-Ms", String(Date.now() - startedAt));
-    res.send(pdfBuffer);
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${sanitizeFilename(filename)}"`
+    );
+
+    return res.send(pdfBuffer);
   } catch (error) {
-    console.error("PDF conversion error:", error);
-    res.status(500).json({
+    console.error("FULL PDF ERROR:", error);
+
+    return res.status(500).json({
       ok: false,
       error: "PDF conversion failed.",
-      details: process.env.NODE_ENV === "production" ? undefined : error.message,
+      details: error.message,
+      stack: error.stack,
     });
+  } finally {
+    if (browser) {
+      await browser.close().catch(() => {});
+    }
   }
+});
+
+// Better body parser error display
+app.use((err, req, res, next) => {
+  console.error("BODY PARSER ERROR:", err);
+
+  return res.status(err.status || 500).json({
+    ok: false,
+    error: "Request body error.",
+    details: err.message,
+    type: err.type,
+  });
 });
 
 app.listen(PORT, "0.0.0.0", () => {
